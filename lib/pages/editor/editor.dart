@@ -1729,6 +1729,7 @@ class EditorState extends State<Editor> with WidgetsBindingObserver {
                       if (res != null) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(
+                            backgroundColor: Colors.green,
                             content: Text('PDF guardado en Obsidian: ${p.basename(res)}'),
                           ),
                         );
