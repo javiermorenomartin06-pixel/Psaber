@@ -49,6 +49,7 @@ class InteractiveCanvasViewer extends StatefulWidget {
     this.transformationController,
     this.alignment,
     this.trackpadScrollCausesScale = false,
+    this.pageWidth,
     required Widget this.child,
   }) : assert(minScale > 0),
        assert(interactionEndFrictionCoefficient > 0),
@@ -96,6 +97,7 @@ class InteractiveCanvasViewer extends StatefulWidget {
     this.transformationController,
     this.alignment,
     this.trackpadScrollCausesScale = false,
+    this.pageWidth,
     required InteractiveCanvasViewerWidgetBuilder this.builder,
   }) : assert(minScale > 0),
        assert(interactionEndFrictionCoefficient > 0),
@@ -115,6 +117,9 @@ class InteractiveCanvasViewer extends StatefulWidget {
        ),
        constrained = false,
        child = null;
+
+  /// Physical unscaled width of the page / document.
+  final double? pageWidth;
 
   /// The alignment of the child's origin, relative to the size of the box.
   final Alignment? alignment;
@@ -493,49 +498,23 @@ class _InteractiveCanvasViewerState extends State<InteractiveCanvasViewer>
   late Offset _scaleAnimationFocalPoint;
   late AnimationController _controller;
   late AnimationController _scaleController;
-  Axis? _currentAxis; // Used with panAxis.
-  Offset? _referenceFocalPoint; // Point where the current gesture began.
-  double? _scaleStart; // Scale value at start of scaling gesture.
-  double? _rotationStart = 0; // Rotation at start of rotation gesture.
-  double _currentRotation = 0; // Rotation of _transformationController.value.
-  _GestureType? _gestureType;
 
-  // -TODO(justinmc): Add rotateEnabled parameter to the widget and remove this
-  // hardcoded value when the rotation feature is implemented.
-  // https://github.com/flutter/flutter/issues/57698
-  final bool _rotateEnabled = false;
+  Offset _previousFocalPoint = Offset.zero;
+  Offset _gestureStartFocalPoint = Offset.zero;
+  double _previousScale = 1.0;
+  Offset _previousTranslation = Offset.zero;
+  double? _scaleStart;
+  bool _isClearlyVertical = false;
 
-  // The _boundaryRect is calculated by adding the boundaryMargin to the size of
-  // the child.
-  Rect get _boundaryRect {
-    assert(_childKey.currentContext != null);
-    assert(!widget.boundaryMargin.left.isNaN);
-    assert(!widget.boundaryMargin.right.isNaN);
-    assert(!widget.boundaryMargin.top.isNaN);
-    assert(!widget.boundaryMargin.bottom.isNaN);
+  final Map<int, PointerDeviceKind> _activePointers = <int, PointerDeviceKind>{};
 
-    final RenderBox childRenderBox =
-        _childKey.currentContext!.findRenderObject()! as RenderBox;
-    final Size childSize = childRenderBox.size;
-    final Rect boundaryRect = widget.boundaryMargin.inflateRect(
-      Offset.zero & childSize,
-    );
-    assert(
-      !boundaryRect.isEmpty,
-      "InteractiveCanvasViewer's child must have nonzero dimensions.",
-    );
-    // Boundaries that are partially infinite are not allowed because Matrix4's
-    // rotation and translation methods don't handle infinites well.
-    assert(
-      boundaryRect.isFinite ||
-          (boundaryRect.left.isInfinite &&
-              boundaryRect.top.isInfinite &&
-              boundaryRect.right.isInfinite &&
-              boundaryRect.bottom.isInfinite),
-      'boundaryRect must either be infinite in all directions or finite in all directions.',
-    );
-    return boundaryRect;
-  }
+  bool get _isStylusActive => _activePointers.values.any(
+        (kind) =>
+            kind == PointerDeviceKind.stylus ||
+            kind == PointerDeviceKind.invertedStylus,
+      );
+
+  bool isCurrentGestureADrawGesture = false;
 
   // The Rect representing the child's parent.
   Rect get _viewport {
@@ -545,183 +524,97 @@ class _InteractiveCanvasViewerState extends State<InteractiveCanvasViewer>
     return Offset.zero & parentRenderBox.size;
   }
 
-  // Return a new matrix representing the given matrix after applying the given
-  // translation.
-  Matrix4 _matrixTranslate(Matrix4 matrix, Offset translation) {
-    if (translation == .zero) {
-      return matrix.clone();
+  Size get _childSize {
+    if (_childKey.currentContext != null) {
+      final RenderBox? childRenderBox =
+          _childKey.currentContext!.findRenderObject() as RenderBox?;
+      return childRenderBox?.size ?? Size.zero;
     }
+    return Size.zero;
+  }
 
-    final Offset alignedTranslation;
+  double get _effectivePageWidth {
+    final Size childSize = _childSize;
+    return widget.pageWidth ??
+        (childSize.width > 0 ? childSize.width : _viewport.width);
+  }
 
-    if (_currentAxis != null) {
-      alignedTranslation = switch (widget.panAxis) {
-        PanAxis.horizontal => _alignAxis(translation, Axis.horizontal),
-        PanAxis.vertical => _alignAxis(translation, Axis.vertical),
-        PanAxis.aligned => _alignAxis(translation, _currentAxis!),
-        PanAxis.free => translation,
-      };
+  double get _totalContentHeight {
+    final Size childSize = _childSize;
+    return childSize.height > 0 ? childSize.height : _viewport.height;
+  }
+
+  static Matrix4 _buildMatrix({
+    required double scale,
+    required double translationX,
+    required double translationY,
+  }) {
+    return Matrix4.identity()
+      ..translateByDouble(translationX, translationY, 0, 1)
+      ..scaleByDouble(scale, scale, 1, 1);
+  }
+
+  /// Calculates the new [Matrix4] transformation separating strictly the behavior
+  /// of the X-axis and Y-axis.
+  Matrix4 _computeTransform({
+    required double newScale,
+    required double focusX,
+    required double focusY,
+    required double previousScale,
+    required Offset previousTranslation,
+    required double deltaX,
+    required double deltaY,
+    bool allowPanX = true,
+  }) {
+    final double viewportWidth = _viewport.width;
+    final double viewportHeight = _viewport.height;
+    final double scaledWidth = _effectivePageWidth * newScale;
+    final double scaledHeight = _totalContentHeight * newScale;
+
+    // 2. Eje X (Comportamiento horizontal exacto estilo Noteshelf):
+    final double targetX;
+    if (scaledWidth <= viewportWidth) {
+      // a) Si scaledWidth <= viewportWidth (La hoja cabe en la pantalla):
+      //    - La posición horizontal DEBE ser una función directa del ancho escalado:
+      //      translationX = (viewportWidth - scaledWidth) / 2
+      //    - Ignora cualquier delta o desplazamiento horizontal proveniente de los dedos.
+      //      Al hacer zoom, la hoja DEBE expandirse de forma 100% simétrica hacia ambos lados manteniéndose centrada.
+      targetX = (viewportWidth - scaledWidth) / 2;
     } else {
-      alignedTranslation = translation;
+      // b) Si scaledWidth > viewportWidth (La hoja supera el ancho de la pantalla):
+      //    - Permite desplazamiento horizontal siguiendo el gesto de dos dedos (pinch/pan).
+      //    - Aplica topes rígidos (clamping) inmediatos para que nunca se vea espacio vacío a los lados:
+      //      minX = viewportWidth - scaledWidth
+      //      maxX = 0
+      //      translationX = clamp(translationX, minX, maxX)
+      final double unconstrainedX = allowPanX
+          ? focusX -
+              (focusX - previousTranslation.dx) * (newScale / previousScale) +
+              deltaX
+          : previousTranslation.dx;
+      final double minX = viewportWidth - scaledWidth;
+      const double maxX = 0.0;
+      targetX = clampDouble(unconstrainedX, minX, maxX);
     }
 
-    final Matrix4 nextMatrix = matrix.clone()
-      ..translateByDouble(alignedTranslation.dx, alignedTranslation.dy, 0, 1);
+    // 3. Eje Y (Comportamiento vertical):
+    //    - Al hacer zoom con dos dedos, escala tomando como pivote el punto vertical medio de los dedos (focusY):
+    //      translationY = focusY - (focusY - previousTranslationY) * (newScale / previousScale) + deltaY
+    //    - Permite el scroll vertical normal a lo largo del documento.
+    final double unconstrainedY = focusY -
+        (focusY - previousTranslation.dy) * (newScale / previousScale) +
+        deltaY;
+    final double minY = math.min(0.0, viewportHeight - scaledHeight);
+    const double maxY = 0.0;
+    final double targetY = clampDouble(unconstrainedY, minY, maxY);
 
-    // Transform the viewport to determine where its four corners will be after
-    // the child has been transformed.
-    final Quad nextViewport = _transformViewport(nextMatrix, _viewport);
-
-    // If the boundaries are infinite, then no need to check if the translation
-    // fits within them.
-    if (_boundaryRect.isInfinite) {
-      return nextMatrix;
-    }
-
-    // Expand the boundaries with rotation. This prevents the problem where a
-    // mismatch in orientation between the viewport and boundaries effectively
-    // limits translation. With this approach, all points that are visible with
-    // no rotation are visible after rotation.
-    final Quad boundariesAabbQuad = _getAxisAlignedBoundingBoxWithRotation(
-      _boundaryRect,
-      _currentRotation,
-    );
-
-    // If the given translation fits completely within the boundaries, allow it.
-    final Offset offendingDistance = _exceedsBy(
-      boundariesAabbQuad,
-      nextViewport,
-    );
-    if (offendingDistance == .zero) {
-      return nextMatrix;
-    }
-
-    // Desired translation goes out of bounds, so translate to the nearest
-    // in-bounds point instead.
-    final Offset nextTotalTranslation = _getMatrixTranslation(nextMatrix);
-    final double currentScale = matrix.getMaxScaleOnAxis();
-    final Offset correctedTotalTranslation = Offset(
-      nextTotalTranslation.dx - offendingDistance.dx * currentScale,
-      nextTotalTranslation.dy - offendingDistance.dy * currentScale,
-    );
-    // -TODO(justinmc): This needs some work to handle rotation properly. The
-    // idea is that the boundaries are axis aligned (boundariesAabbQuad), but
-    // calculating the translation to put the viewport inside that Quad is more
-    // complicated than this when rotated.
-    // https://github.com/flutter/flutter/issues/57698
-    final Matrix4 correctedMatrix = matrix.clone()
-      ..setTranslation(
-        Vector3(correctedTotalTranslation.dx, correctedTotalTranslation.dy, 0),
-      );
-
-    // Double check that the corrected translation fits.
-    final Quad correctedViewport = _transformViewport(
-      correctedMatrix,
-      _viewport,
-    );
-    final Offset offendingCorrectedDistance = _exceedsBy(
-      boundariesAabbQuad,
-      correctedViewport,
-    );
-    if (offendingCorrectedDistance == .zero) {
-      return correctedMatrix;
-    }
-
-    // If the corrected translation doesn't fit in either direction, don't allow
-    // any translation at all. This happens when the viewport is larger than the
-    // entire boundary.
-    if (offendingCorrectedDistance.dx != 0.0 &&
-        offendingCorrectedDistance.dy != 0.0) {
-      return matrix.clone();
-    }
-
-    // Otherwise, allow translation in only the direction that fits. This
-    // happens when the viewport is larger than the boundary in one direction.
-    final Offset unidirectionalCorrectedTotalTranslation = Offset(
-      offendingCorrectedDistance.dx == 0.0 ? correctedTotalTranslation.dx : 0.0,
-      offendingCorrectedDistance.dy == 0.0 ? correctedTotalTranslation.dy : 0.0,
-    );
-    return matrix.clone()..setTranslation(
-      Vector3(
-        unidirectionalCorrectedTotalTranslation.dx,
-        unidirectionalCorrectedTotalTranslation.dy,
-        0,
-      ),
+    return _buildMatrix(
+      scale: newScale,
+      translationX: targetX,
+      translationY: targetY,
     );
   }
 
-  // Return a new matrix representing the given matrix after applying the given
-  // scale.
-  Matrix4 _matrixScale(Matrix4 matrix, double scale) {
-    if (scale == 1.0) {
-      return matrix.clone();
-    }
-    assert(scale != 0.0);
-
-    // Don't allow a scale that results in an overall scale beyond min/max
-    // scale.
-    final double currentScale = _transformer.value.getMaxScaleOnAxis();
-    final double totalScale = math.max(
-      currentScale * scale,
-      // Ensure that the scale cannot make the child so big that it can't fit
-      // inside the boundaries (in either direction).
-      math.max(
-        _viewport.width / _boundaryRect.width,
-        _viewport.height / _boundaryRect.height,
-      ),
-    );
-    final double clampedTotalScale = clampDouble(
-      totalScale,
-      widget.minScale,
-      widget.maxScale,
-    );
-    final double clampedScale = clampedTotalScale / currentScale;
-    return matrix.clone()
-      ..scaleByDouble(clampedScale, clampedScale, clampedScale, 1);
-  }
-
-  // Return a new matrix representing the given matrix after applying the given
-  // rotation.
-  Matrix4 _matrixRotate(Matrix4 matrix, double rotation, Offset focalPoint) {
-    if (rotation == 0) {
-      return matrix.clone();
-    }
-    final Offset focalPointScene = _transformer.toScene(focalPoint);
-    return matrix.clone()
-      ..translateByDouble(focalPointScene.dx, focalPointScene.dy, 0, 1)
-      ..rotateZ(-rotation)
-      ..translateByDouble(-focalPointScene.dx, -focalPointScene.dy, 0, 1);
-  }
-
-  // Returns true iff the given _GestureType is enabled.
-  bool _gestureIsSupported(_GestureType? gestureType) {
-    return switch (gestureType) {
-      _GestureType.rotate => _rotateEnabled,
-      _GestureType.scale => widget.scaleEnabled,
-      _GestureType.pan || null => widget.panEnabled,
-    };
-  }
-
-  // Decide which type of gesture this is by comparing the amount of scale
-  // and rotation in the gesture, if any. Scale starts at 1 and rotation
-  // starts at 0. Pan will have no scale and no rotation because it uses only one
-  // finger.
-  _GestureType _getGestureType(ScaleUpdateDetails details) {
-    final double scale = !widget.scaleEnabled ? 1.0 : details.scale;
-    final double rotation = !_rotateEnabled ? 0.0 : details.rotation;
-    if ((scale - 1).abs() > rotation.abs()) {
-      return _GestureType.scale;
-    } else if (rotation != 0.0) {
-      return _GestureType.rotate;
-    } else {
-      return _GestureType.pan;
-    }
-  }
-
-  bool isCurrentGestureADrawGesture = false;
-
-  // Handle the start of a gesture. All of pan, scale, and rotate are handled
-  // with GestureDetector's scale gesture.
   void _onScaleStart(ScaleStartDetails details) {
     if (_controller.isAnimating) {
       _controller.stop();
@@ -736,300 +629,300 @@ class _InteractiveCanvasViewerState extends State<InteractiveCanvasViewer>
       _scaleAnimation = null;
     }
 
-    _gestureType = null;
-    _currentAxis = null;
     _scaleStart = _transformer.value.getMaxScaleOnAxis();
-    _referenceFocalPoint = _transformer.toScene(details.localFocalPoint);
-    _rotationStart = _currentRotation;
+    _gestureStartFocalPoint = details.localFocalPoint;
+    _previousFocalPoint = details.localFocalPoint;
+    _previousScale = _scaleStart!;
+    _previousTranslation = _getMatrixTranslation(_transformer.value);
+    _isClearlyVertical = false;
 
-    if (widget.isDrawGesture?.call(details) ?? false) {
+    // 4. Detección de stylus y palma (Palm Rejection):
+    // Cualquier evento de puntero clasificado como STYLUS debe usarse exclusivamente
+    // para dibujar trazos, anulando cualquier cálculo de paneo o zoom del lienzo.
+    final bool isStylus = _isStylusActive;
+    final bool isDraw =
+        isStylus || (widget.isDrawGesture?.call(details) ?? false);
+
+    if (isDraw) {
       isCurrentGestureADrawGesture = true;
       widget.onDrawStart?.call(details);
-    }
-  }
-
-  // Handle an update to an ongoing gesture. All of pan, scale, and rotate are
-  // handled with GestureDetector's scale gesture.
-  void _onScaleUpdate(ScaleUpdateDetails details) {
-    final double scale = _transformer.value.getMaxScaleOnAxis();
-    _scaleAnimationFocalPoint = details.localFocalPoint;
-    final Offset focalPointScene = _transformer.toScene(
-      details.localFocalPoint,
-    );
-
-    if (_gestureType == _GestureType.pan) {
-      // When a gesture first starts, it sometimes has no change in scale and
-      // rotation despite being a two-finger gesture. Here the gesture is
-      // allowed to be reinterpreted as its correct type after originally
-      // being marked as a pan.
-      _gestureType = _getGestureType(details);
-    } else {
-      _gestureType ??= _getGestureType(details);
-    }
-    if (!_gestureIsSupported(_gestureType) && !isCurrentGestureADrawGesture) {
       return;
     }
 
-    switch (_gestureType!) {
-      case _GestureType.scale:
-        assert(_scaleStart != null);
-        // details.scale gives us the amount to change the scale as of the
-        // start of this gesture, so calculate the amount to scale as of the
-        // previous call to _onScaleUpdate.
-        final double desiredScale = _scaleStart! * details.scale;
-        final double scaleChange = desiredScale / scale;
-        _transformer.value = _matrixScale(_transformer.value, scaleChange);
-
-        // While scaling, translate such that the user's two fingers stay on
-        // the same places in the scene. That means that the focal point of
-        // the scale should be on the same place in the scene before and after
-        // the scale.
-        final Offset focalPointSceneScaled = _transformer.toScene(
-          details.localFocalPoint,
-        );
-        _transformer.value = _matrixTranslate(
-          _transformer.value,
-          focalPointSceneScaled - _referenceFocalPoint!,
-        );
-
-        // details.localFocalPoint should now be at the same location as the
-        // original _referenceFocalPoint point. If it's not, that's because
-        // the translate came in contact with a boundary. In that case, update
-        // _referenceFocalPoint so subsequent updates happen in relation to
-        // the new effective focal point.
-        final Offset focalPointSceneCheck = _transformer.toScene(
-          details.localFocalPoint,
-        );
-        if (_round(_referenceFocalPoint!) != _round(focalPointSceneCheck)) {
-          _referenceFocalPoint = focalPointSceneCheck;
-        }
-
-      case _GestureType.rotate:
-        if (details.rotation == 0.0) {
-          return;
-        }
-        final double desiredRotation = _rotationStart! + details.rotation;
-        _transformer.value = _matrixRotate(
-          _transformer.value,
-          _currentRotation - desiredRotation,
-          details.localFocalPoint,
-        );
-        _currentRotation = desiredRotation;
-
-      case _GestureType.pan:
-        assert(_referenceFocalPoint != null);
-        // details may have a change in scale here when scaleEnabled is false.
-        // In an effort to keep the behavior similar whether or not scaleEnabled
-        // is true, these gestures are thrown away.
-        if (details.scale != 1.0) {
-          return;
-        }
-
-        if (isCurrentGestureADrawGesture) {
-          widget.onDrawUpdate?.call(details);
-        } else {
-          _currentAxis ??= _getPanAxis(_referenceFocalPoint!, focalPointScene);
-          // Translate so that the same point in the scene is underneath the
-          // focal point before and after the movement.
-          final Offset translationChange =
-              focalPointScene - _referenceFocalPoint!;
-          _transformer.value = _matrixTranslate(
-            _transformer.value,
-            translationChange,
-          );
-          _referenceFocalPoint = _transformer.toScene(details.localFocalPoint);
-        }
-    }
+    isCurrentGestureADrawGesture = false;
   }
 
-  // Handle the end of a gesture of _GestureType. All of pan, scale, and rotate
-  // are handled with GestureDetector's scale gesture.
+  void _onScaleUpdate(ScaleUpdateDetails details) {
+    // 4. Detección de stylus y palma (Palm Rejection):
+    // Si hay un stylus activo o es un gesto de dibujo, anula cualquier cálculo de paneo o zoom del lienzo.
+    if (isCurrentGestureADrawGesture || _isStylusActive) {
+      widget.onDrawUpdate?.call(details);
+      return;
+    }
+
+    final double currentScale = _transformer.value.getMaxScaleOnAxis();
+    final Offset currentTranslation = _getMatrixTranslation(_transformer.value);
+
+    // 4. El desplazamiento del lienzo debe requerir 2 dedos (two-finger drag)
+    // o, si es con un solo dedo, solo responder a movimientos claramente verticales.
+    if (details.pointerCount == 1) {
+      if (!widget.panEnabled) {
+        _previousFocalPoint = details.localFocalPoint;
+        return;
+      }
+
+      final double totalDx =
+          (details.localFocalPoint.dx - _gestureStartFocalPoint.dx).abs();
+      final double totalDy =
+          (details.localFocalPoint.dy - _gestureStartFocalPoint.dy).abs();
+
+      if (!_isClearlyVertical) {
+        if (totalDy > totalDx * 1.5 && totalDy > 8.0) {
+          _isClearlyVertical = true;
+        }
+      }
+
+      if (!_isClearlyVertical) {
+        _previousFocalPoint = details.localFocalPoint;
+        return;
+      }
+
+      final double deltaY = details.localFocalPoint.dy - _previousFocalPoint.dy;
+
+      _transformer.value = _computeTransform(
+        newScale: currentScale,
+        focusX: details.localFocalPoint.dx,
+        focusY: details.localFocalPoint.dy,
+        previousScale: currentScale,
+        previousTranslation: currentTranslation,
+        deltaX: 0.0,
+        deltaY: deltaY,
+        allowPanX: false,
+      );
+
+      _previousFocalPoint = details.localFocalPoint;
+      _previousScale = currentScale;
+      _previousTranslation = _getMatrixTranslation(_transformer.value);
+      return;
+    }
+
+    // Dos o más dedos (two-finger drag / pinch):
+    final double desiredScale = _scaleStart != null
+        ? _scaleStart! * details.scale
+        : currentScale * details.scale;
+    final double newScale = widget.scaleEnabled
+        ? clampDouble(desiredScale, widget.minScale, widget.maxScale)
+        : currentScale;
+
+    final double focusX = details.localFocalPoint.dx;
+    final double focusY = details.localFocalPoint.dy;
+    final double deltaX = focusX - _previousFocalPoint.dx;
+    final double deltaY = focusY - _previousFocalPoint.dy;
+
+    _transformer.value = _computeTransform(
+      newScale: newScale,
+      focusX: focusX,
+      focusY: focusY,
+      previousScale: _previousScale > 0 ? _previousScale : currentScale,
+      previousTranslation: _previousTranslation,
+      deltaX: deltaX,
+      deltaY: deltaY,
+      allowPanX: true,
+    );
+
+    _previousFocalPoint = details.localFocalPoint;
+    _previousScale = newScale;
+    _previousTranslation = _getMatrixTranslation(_transformer.value);
+  }
+
   void _onScaleEnd(ScaleEndDetails details) {
     widget.onInteractionEnd?.call(details);
 
     if (isCurrentGestureADrawGesture) {
       isCurrentGestureADrawGesture = false;
-      return widget.onDrawEnd?.call(details);
+      widget.onDrawEnd?.call(details);
+      return;
     }
 
     _scaleStart = null;
-    _rotationStart = null;
-    _referenceFocalPoint = null;
-
     _animation?.removeListener(_handleInertiaAnimation);
     _scaleAnimation?.removeListener(_handleScaleAnimation);
     _controller.reset();
     _scaleController.reset();
 
-    if (!_gestureIsSupported(_gestureType)) {
-      _currentAxis = null;
-      return;
-    }
+    final double velocityDist = details.velocity.pixelsPerSecond.distance;
+    if (velocityDist >= kMinFlingVelocity && widget.panEnabled) {
+      final double currentScale = _transformer.value.getMaxScaleOnAxis();
+      final Offset translation = _getMatrixTranslation(_transformer.value);
 
-    switch (_gestureType) {
-      case _GestureType.pan:
-        if (details.velocity.pixelsPerSecond.distance < kMinFlingVelocity) {
-          _currentAxis = null;
-          return;
-        }
-        final Vector3 translationVector = _transformer.value.getTranslation();
-        final Offset translation = Offset(
-          translationVector.x,
-          translationVector.y,
-        );
-        final FrictionSimulation frictionSimulationX = FrictionSimulation(
-          widget.interactionEndFrictionCoefficient,
-          translation.dx,
-          details.velocity.pixelsPerSecond.dx,
-        );
-        final FrictionSimulation frictionSimulationY = FrictionSimulation(
-          widget.interactionEndFrictionCoefficient,
-          translation.dy,
-          details.velocity.pixelsPerSecond.dy,
-        );
-        final double tFinal = _getFinalTime(
-          details.velocity.pixelsPerSecond.distance,
-          widget.interactionEndFrictionCoefficient,
-        );
-        _animation = Tween<Offset>(
-          begin: translation,
-          end: Offset(frictionSimulationX.finalX, frictionSimulationY.finalX),
-        ).chain(CurveTween(curve: Curves.decelerate)).animate(_controller);
-        _controller.duration = Duration(milliseconds: (tFinal * 1000).round());
-        _animation!.addListener(_handleInertiaAnimation);
-        _controller.forward();
-      case _GestureType.scale:
-        if (details.scaleVelocity.abs() < 0.1) {
-          _currentAxis = null;
-          return;
-        }
-        final double scale = _transformer.value.getMaxScaleOnAxis();
-        final FrictionSimulation frictionSimulation = FrictionSimulation(
-          widget.interactionEndFrictionCoefficient * widget.scaleFactor,
-          scale,
-          details.scaleVelocity / 10,
-        );
-        final double tFinal = _getFinalTime(
-          details.scaleVelocity.abs(),
-          widget.interactionEndFrictionCoefficient,
-          effectivelyMotionless: 0.1,
-        );
-        _scaleAnimation = Tween<double>(
-          begin: scale,
-          end: frictionSimulation.x(tFinal),
-        ).chain(CurveTween(curve: Curves.decelerate)).animate(_scaleController);
-        _scaleController.duration = Duration(
-          milliseconds: (tFinal * 1000).round(),
-        );
-        _scaleAnimation!.addListener(_handleScaleAnimation);
-        _scaleController.forward();
-      case _GestureType.rotate || null:
-        break;
+      final double viewportWidth = _viewport.width;
+      final double viewportHeight = _viewport.height;
+      final double scaledWidth = _effectivePageWidth * currentScale;
+      final double scaledHeight = _totalContentHeight * currentScale;
+
+      final bool canPanX = scaledWidth > viewportWidth;
+      final double velocityX =
+          canPanX ? details.velocity.pixelsPerSecond.dx : 0.0;
+      final double velocityY = details.velocity.pixelsPerSecond.dy;
+
+      final FrictionSimulation frictionSimulationX = FrictionSimulation(
+        widget.interactionEndFrictionCoefficient,
+        translation.dx,
+        velocityX,
+      );
+      final FrictionSimulation frictionSimulationY = FrictionSimulation(
+        widget.interactionEndFrictionCoefficient,
+        translation.dy,
+        velocityY,
+      );
+
+      final double effectiveVelocity =
+          canPanX ? velocityDist : velocityY.abs();
+      final double tFinal = _getFinalTime(
+        effectiveVelocity,
+        widget.interactionEndFrictionCoefficient,
+      );
+
+      final double finalX;
+      if (!canPanX) {
+        finalX = (viewportWidth - scaledWidth) / 2;
+      } else {
+        final double minX = viewportWidth - scaledWidth;
+        finalX = clampDouble(frictionSimulationX.finalX, minX, 0.0);
+      }
+
+      final double minY = math.min(0.0, viewportHeight - scaledHeight);
+      final double finalY = clampDouble(frictionSimulationY.finalX, minY, 0.0);
+
+      _animation = Tween<Offset>(
+        begin: translation,
+        end: Offset(finalX, finalY),
+      ).chain(CurveTween(curve: Curves.decelerate)).animate(_controller);
+      _controller.duration = Duration(milliseconds: (tFinal * 1000).round());
+      _animation!.addListener(_handleInertiaAnimation);
+      _controller.forward();
+    } else if (details.scaleVelocity.abs() >= 0.1 && widget.scaleEnabled) {
+      final double scale = _transformer.value.getMaxScaleOnAxis();
+      final FrictionSimulation frictionSimulation = FrictionSimulation(
+        widget.interactionEndFrictionCoefficient * widget.scaleFactor,
+        scale,
+        details.scaleVelocity / 10,
+      );
+      final double tFinal = _getFinalTime(
+        details.scaleVelocity.abs(),
+        widget.interactionEndFrictionCoefficient,
+        effectivelyMotionless: 0.1,
+      );
+      _scaleAnimationFocalPoint = _previousFocalPoint;
+      _scaleAnimation = Tween<double>(
+        begin: scale,
+        end: clampDouble(
+          frictionSimulation.x(tFinal),
+          widget.minScale,
+          widget.maxScale,
+        ),
+      ).chain(CurveTween(curve: Curves.decelerate)).animate(_scaleController);
+      _scaleController.duration =
+          Duration(milliseconds: (tFinal * 1000).round());
+      _scaleAnimation!.addListener(_handleScaleAnimation);
+      _scaleController.forward();
     }
   }
 
-  // Handle mousewheel and web trackpad scroll events.
   void _receivedPointerSignal(PointerSignalEvent event) {
     final Offset local = event.localPosition;
-    final Offset global = event.position;
-    final double scaleChange;
+    final double currentScale = _transformer.value.getMaxScaleOnAxis();
+    final Offset currentTranslation = _getMatrixTranslation(_transformer.value);
+
     if (event is PointerScrollEvent) {
       if (!HardwareKeyboard.instance.isControlPressed &&
           !HardwareKeyboard.instance.isMetaPressed) {
-        // Scroll without Ctrl pressed, so treat it as a pan.
-        if (!_gestureIsSupported(_GestureType.pan)) return;
-
-        final Offset localDelta = PointerEvent.transformDeltaViaPositions(
-          untransformedEndPosition: global + event.scrollDelta,
-          untransformedDelta: event.scrollDelta,
-          transform: event.transform,
+        if (!widget.panEnabled) return;
+        _transformer.value = _computeTransform(
+          newScale: currentScale,
+          focusX: local.dx,
+          focusY: local.dy,
+          previousScale: currentScale,
+          previousTranslation: currentTranslation,
+          deltaX: -event.scrollDelta.dx,
+          deltaY: -event.scrollDelta.dy,
+          allowPanX: true,
         );
-
-        final Offset focalPointScene = _transformer.toScene(local);
-
-        final Offset newFocalPointScene = _transformer.toScene(
-          local - localDelta,
-        );
-
-        _transformer.value = _matrixTranslate(
-          _transformer.value,
-          newFocalPointScene - focalPointScene,
-        );
-
         return;
       }
-      // Ignore left and right mouse wheel scroll.
-      if (event.scrollDelta.dy == 0.0) {
-        return;
-      }
-      scaleChange = math.exp(-event.scrollDelta.dy / widget.scaleFactor);
+      if (event.scrollDelta.dy == 0.0) return;
+      if (!widget.scaleEnabled) return;
+      final double scaleChange =
+          math.exp(-event.scrollDelta.dy / widget.scaleFactor);
+      final double newScale = clampDouble(
+        currentScale * scaleChange,
+        widget.minScale,
+        widget.maxScale,
+      );
+      _transformer.value = _computeTransform(
+        newScale: newScale,
+        focusX: local.dx,
+        focusY: local.dy,
+        previousScale: currentScale,
+        previousTranslation: currentTranslation,
+        deltaX: 0.0,
+        deltaY: 0.0,
+        allowPanX: true,
+      );
     } else if (event is PointerScaleEvent) {
-      scaleChange = event.scale;
-    } else {
-      return;
+      if (!widget.scaleEnabled) return;
+      final double newScale = clampDouble(
+        currentScale * event.scale,
+        widget.minScale,
+        widget.maxScale,
+      );
+      _transformer.value = _computeTransform(
+        newScale: newScale,
+        focusX: local.dx,
+        focusY: local.dy,
+        previousScale: currentScale,
+        previousTranslation: currentTranslation,
+        deltaX: 0.0,
+        deltaY: 0.0,
+        allowPanX: true,
+      );
     }
-
-    if (!_gestureIsSupported(_GestureType.scale)) return;
-
-    final Offset focalPointScene = _transformer.toScene(local);
-
-    _transformer.value = _matrixScale(_transformer.value, scaleChange);
-
-    // After scaling, translate such that the event's position is at the
-    // same scene point before and after the scale.
-    final Offset focalPointSceneScaled = _transformer.toScene(local);
-    _transformer.value = _matrixTranslate(
-      _transformer.value,
-      focalPointSceneScaled - focalPointScene,
-    );
   }
 
-  // Handle inertia drag animation.
   void _handleInertiaAnimation() {
     if (!_controller.isAnimating) {
-      _currentAxis = null;
       _animation?.removeListener(_handleInertiaAnimation);
       _animation = null;
       _controller.reset();
       return;
     }
-    // Translate such that the resulting translation is _animation.value.
-    final Vector3 translationVector = _transformer.value.getTranslation();
-    final Offset translation = Offset(translationVector.x, translationVector.y);
-    _transformer.value = _matrixTranslate(
-      _transformer.value,
-      _transformer.toScene(_animation!.value) -
-          _transformer.toScene(translation),
+    final double currentScale = _transformer.value.getMaxScaleOnAxis();
+    _transformer.value = _buildMatrix(
+      scale: currentScale,
+      translationX: _animation!.value.dx,
+      translationY: _animation!.value.dy,
     );
   }
 
-  // Handle inertia scale animation.
   void _handleScaleAnimation() {
     if (!_scaleController.isAnimating) {
-      _currentAxis = null;
       _scaleAnimation?.removeListener(_handleScaleAnimation);
       _scaleAnimation = null;
       _scaleController.reset();
       return;
     }
     final double desiredScale = _scaleAnimation!.value;
-    final double scaleChange =
-        desiredScale / _transformer.value.getMaxScaleOnAxis();
-    final Offset referenceFocalPoint = _transformer.toScene(
-      _scaleAnimationFocalPoint,
-    );
-    _transformer.value = _matrixScale(_transformer.value, scaleChange);
-
-    // While scaling, translate such that the user's two fingers stay on
-    // the same places in the scene. That means that the focal point of
-    // the scale should be on the same place in the scene before and after
-    // the scale.
-    final Offset focalPointSceneScaled = _transformer.toScene(
-      _scaleAnimationFocalPoint,
-    );
-    _transformer.value = _matrixTranslate(
-      _transformer.value,
-      focalPointSceneScaled - referenceFocalPoint,
+    final double currentScale = _transformer.value.getMaxScaleOnAxis();
+    final Offset currentTranslation = _getMatrixTranslation(_transformer.value);
+    _transformer.value = _computeTransform(
+      newScale: desiredScale,
+      focusX: _scaleAnimationFocalPoint.dx,
+      focusY: _scaleAnimationFocalPoint.dy,
+      previousScale: currentScale,
+      previousTranslation: currentTranslation,
+      deltaX: 0.0,
+      deltaY: 0.0,
+      allowPanX: true,
     );
   }
 
@@ -1113,6 +1006,18 @@ class _InteractiveCanvasViewerState extends State<InteractiveCanvasViewer>
 
     return Listener(
       key: _parentKey,
+      onPointerDown: (PointerDownEvent event) {
+        _activePointers[event.pointer] = event.kind;
+      },
+      onPointerMove: (PointerMoveEvent event) {
+        _activePointers[event.pointer] = event.kind;
+      },
+      onPointerUp: (PointerUpEvent event) {
+        _activePointers.remove(event.pointer);
+      },
+      onPointerCancel: (PointerCancelEvent event) {
+        _activePointers.remove(event.pointer);
+      },
       onPointerSignal: _receivedPointerSignal,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque, // Necessary when panning off screen.

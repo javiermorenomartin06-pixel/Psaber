@@ -165,6 +165,7 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
         scaleDelta: 0.1,
         transformation: widget._transformationController.value,
         containerBounds: containerBounds,
+        pageWidth: effectivePageWidth,
       ) ??
       widget._transformationController.value;
   void zoomOut() => widget._transformationController.value =
@@ -172,6 +173,7 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
         scaleDelta: -0.1,
         transformation: widget._transformationController.value,
         containerBounds: containerBounds,
+        pageWidth: effectivePageWidth,
       ) ??
       widget._transformationController.value;
   @visibleForTesting
@@ -179,24 +181,41 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
     required double scaleDelta,
     required Matrix4 transformation,
     required BoxConstraints containerBounds,
+    double? pageWidth,
   }) {
     final oldScale = transformation.approxScale;
-    final newScale = oldScale + scaleDelta;
-
-    if (newScale < CanvasGestureDetector.kMinScale) return null;
-    if (newScale > CanvasGestureDetector.kMaxScale) return null;
-
-    final center = Vector3(
-      containerBounds.maxWidth / 2,
-      containerBounds.maxHeight / 2,
-      0,
+    final newScale = clampDouble(
+      oldScale + scaleDelta,
+      CanvasGestureDetector.kMinScale,
+      CanvasGestureDetector.kMaxScale,
     );
-    final translation =
-        (transformation.getTranslation() - center) * (newScale / oldScale) +
-        center;
 
-    return Matrix4.translation(translation)
-      ..scaleByDouble(newScale, newScale, newScale, 1);
+    if (newScale == oldScale) return null;
+
+    final viewportWidth = containerBounds.maxWidth;
+    final effectiveWidth = pageWidth ?? viewportWidth;
+    final scaledWidth = effectiveWidth * newScale;
+    final oldTranslation = transformation.getTranslation();
+
+    final double targetX;
+    if (scaledWidth <= viewportWidth) {
+      targetX = (viewportWidth - scaledWidth) / 2;
+    } else {
+      final double focusX = viewportWidth / 2;
+      final double unconstrainedX =
+          focusX - (focusX - oldTranslation.x) * (newScale / oldScale);
+      final double minX = viewportWidth - scaledWidth;
+      const double maxX = 0.0;
+      targetX = clampDouble(unconstrainedX, minX, maxX);
+    }
+
+    final double focusY = containerBounds.maxHeight / 2;
+    final double unconstrainedY =
+        focusY - (focusY - oldTranslation.y) * (newScale / oldScale);
+
+    return Matrix4.identity()
+      ..translateByDouble(targetX, unconstrainedY, 0, 1)
+      ..scaleByDouble(newScale, newScale, 1, 1);
   }
 
   final Map<AxisDirection, Timer> _arrowKeyPanTimers = {};
@@ -221,6 +240,15 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
 
   void _arrowKeyPanNow(AxisDirection direction) {
     final transformation = widget._transformationController.value;
+    final scale = transformation.approxScale;
+    final double contentWidth = containerBounds.maxWidth;
+    final double scaledWidth = contentWidth * scale;
+
+    if ((direction == AxisDirection.left || direction == AxisDirection.right) &&
+        scaledWidth <= containerBounds.maxWidth) {
+      return;
+    }
+
     const panAmount = 50.0;
 
     transformation.leftTranslateByDouble(
@@ -358,11 +386,17 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
 
   Timer? _snapZoomTimer;
 
+  double get effectivePageWidth {
+    if (widget.pages.isEmpty) return containerBounds.maxWidth;
+    final firstPageWidth = widget.pages.first.size.width;
+    return min(firstPageWidth, containerBounds.maxWidth);
+  }
+
   /// Corrects the transform if it's out of bounds.
   /// If the scale is less than 1, centers the pages horizontally.
   /// Otherwise, prevents the user from scrolling past the edges.
   void onTransformChanged() {
-    final scale = widget._transformationController.value.approxScale;
+    final currentZoom = widget._transformationController.value.approxScale;
     final translation = widget._transformationController.value.getTranslation();
 
     double adjustmentX = 0;
@@ -370,30 +404,36 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
 
     // snap to 1.0x zoom
     _snapZoomTimer?.cancel();
-    final diffFrom1 = (scale - 1).abs();
+    final diffFrom1 = (currentZoom - 1).abs();
     // allow 0.001 leeway for floating point error
-    if (diffFrom1 < 0.05 && diffFrom1 > 0.001)
+    if (diffFrom1 < 0.05 && diffFrom1 > 0.001) {
       _snapZoomTimer = Timer(const Duration(milliseconds: 200), resetZoom);
+    }
 
-    if (scale < 1) {
-      // horizontally center pages if zoomed out
-      final center = containerBounds.maxWidth * (1 - scale) / 2;
-      adjustmentX = center - translation.x;
+    final viewportWidth = containerBounds.maxWidth;
+    final scaledWidth = effectivePageWidth * currentZoom;
+
+    if (scaledWidth <= viewportWidth) {
+      // Bloquea completamente el desplazamiento en el eje X:
+      // translationX = (viewportWidth - scaledWidth) / 2
+      final targetX = (viewportWidth - scaledWidth) / 2;
+      adjustmentX = targetX - translation.x;
     } else {
-      // if zoomed in, don't allow scrolling past the edges
-      late final minX = containerBounds.maxWidth * (1 - scale);
-      if (translation.x > 0) {
-        adjustmentX = -translation.x;
-      } else if (translation.x < minX) {
-        adjustmentX = minX - translation.x;
-      }
+      // Clamping estricto cuando sobrepasa la pantalla:
+      // minX = viewportWidth - scaledWidth
+      // maxX = 0
+      // translationX = clamp(translationX, minX, maxX)
+      final minX = viewportWidth - scaledWidth;
+      const maxX = 0.0;
+      final clampedX = clampDouble(translation.x, minX, maxX);
+      adjustmentX = clampedX - translation.x;
 
       if (translation.y > 0) {
         adjustmentY = -translation.y;
       }
     }
 
-    if (adjustmentX.abs() > 0.1 || adjustmentY.abs() > 0.1) {
+    if (adjustmentX.abs() > 0.01 || adjustmentY.abs() > 0.01) {
       widget._transformationController.value.leftTranslateByDouble(
         adjustmentX,
         adjustmentY,
@@ -414,6 +454,7 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
           scaleDelta: 1 - scale,
           transformation: transformation,
           containerBounds: containerBounds,
+          pageWidth: effectivePageWidth,
         ) ??
         transformation;
   }
@@ -505,6 +546,7 @@ class CanvasGestureDetectorState extends State<CanvasGestureDetector> {
                   maxScale: zoomLockedValue ?? CanvasGestureDetector.kMaxScale,
                   panEnabled: !singleFingerPanLock,
                   panAxis: axisAlignedPanLock ? PanAxis.aligned : PanAxis.free,
+                  pageWidth: effectivePageWidth,
 
                   // Smoother scrolling fling gesture than the default
                   interactionEndFrictionCoefficient: 0.1,

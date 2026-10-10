@@ -549,7 +549,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 const SettingsSubtitle(subtitle: 'Obsidian / Auto-PDF'),
                 SettingsSwitch(
                   title: 'Auto-exportar notas a PDF',
-                  subtitle: 'Sobrescribe automáticamente un único PDF en tu bóveda al guardar',
+                  subtitle: 'Sincroniza y sobrescribe el PDF en tu bóveda al guardar las notas seleccionadas',
                   icon: Icons.picture_as_pdf,
                   pref: stows.autoExportPdf,
                 ),

@@ -72,6 +72,9 @@ class EditorCoreInfo {
   int lineThickness;
   List<EditorPage> pages;
 
+  /// Whether this note should be automatically exported to PDF (e.g. into Obsidian Vault)
+  bool autoExportPdf;
+
   /// Stores the current page index so that it can be restored when the file is reloaded.
   int? initialPageIndex;
 
@@ -87,6 +90,7 @@ class EditorCoreInfo {
         pages: [],
         initialPageIndex: null,
         assetCache: null,
+        autoExportPdf: false,
       ).._migrateOldStrokesAndImages(
         fileVersion: sbnVersion,
         strokesJson: null,
@@ -99,7 +103,7 @@ class EditorCoreInfo {
   bool get isNotEmpty => !isEmpty;
 
   @visibleForTesting
-  new({required this.filePath, this.readOnlyReason})
+  new({required this.filePath, this.readOnlyReason, this.autoExportPdf = false})
     : nextImageId = 0,
       backgroundPattern = stows.lastBackgroundPattern.value,
       lineHeight = stows.lastLineHeight.value,
@@ -118,6 +122,7 @@ class EditorCoreInfo {
     required this.pages,
     required this.initialPageIndex,
     required AssetCache? assetCache,
+    this.autoExportPdf = false,
   }) : assetCache = assetCache ?? AssetCache() {
     _handleEmptyImageIds();
   }
@@ -193,6 +198,7 @@ class EditorCoreInfo {
         ),
         initialPageIndex: json['c'] as int?,
         assetCache: assetCache,
+        autoExportPdf: json['ep'] as bool? ?? false,
       )
       .._migrateOldStrokesAndImages(
         fileVersion: fileVersion,
@@ -217,7 +223,8 @@ class EditorCoreInfo {
        lineHeight = stows.lastLineHeight.value,
        lineThickness = stows.lastLineThickness.value,
        pages = [],
-       assetCache = AssetCache() {
+       assetCache = AssetCache(),
+       autoExportPdf = false {
     _migrateOldStrokesAndImages(
       fileVersion: 0,
       strokesJson: json,
@@ -482,6 +489,7 @@ class EditorCoreInfo {
       'lt': lineThickness,
       'z': pages.map((EditorPage page) => page.toJson(assets)).toList(),
       'c': initialPageIndex,
+      'ep': autoExportPdf,
     };
 
     return (json, assets);
@@ -543,6 +551,7 @@ class EditorCoreInfo {
     int? lineHeight,
     int? lineThickness,
     List<EditorPage>? pages,
+    bool? autoExportPdf,
   }) {
     return EditorCoreInfo._(
       filePath: filePath ?? this.filePath,
@@ -555,6 +564,7 @@ class EditorCoreInfo {
       pages: pages ?? this.pages,
       initialPageIndex: initialPageIndex,
       assetCache: assetCache,
+      autoExportPdf: autoExportPdf ?? this.autoExportPdf,
     );
   }
 }

@@ -532,12 +532,17 @@ class EditorState extends State<Editor> with WidgetsBindingObserver {
     CanvasImage.activeListener
         .notifyListenersPlease(); // un-select active image
 
+    final bool isStylus =
+        currentPointerKind == PointerDeviceKind.stylus ||
+        currentPointerKind == PointerDeviceKind.invertedStylus ||
+        currentPressure != null;
+
     _lastSeenPointerCountTimer?.cancel();
-    if (lastSeenPointerCount >= 2) {
+    if (!isStylus && lastSeenPointerCount >= 2) {
       // was a zoom gesture, ignore
       lastSeenPointerCount = lastSeenPointerCount;
       return false;
-    } else if (details.pointerCount >= 2) {
+    } else if (!isStylus && details.pointerCount >= 2) {
       // is a zoom gesture, remove accidental stroke
       if (lastSeenPointerCount == 1 &&
           stows.editorFingerDrawing.value &&
@@ -1001,7 +1006,9 @@ class EditorState extends State<Editor> with WidgetsBindingObserver {
     );
 
     if (!mounted) return;
-    if (stows.autoExportPdf.value && stows.obsidianVaultPath.value != null) {
+    if (stows.autoExportPdf.value &&
+        stows.obsidianVaultPath.value != null &&
+        coreInfo.autoExportPdf) {
       PdfAutoExporter.autoExportToObsidian(
         coreInfo: coreInfo,
         context: context,
@@ -1347,6 +1354,120 @@ class EditorState extends State<Editor> with WidgetsBindingObserver {
       '${coreInfo.fileName}.pdf',
       bytes,
       context: context,
+    );
+  }
+
+  void _showPdfOptionsDialog() {
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Row(
+                children: [
+                  Icon(Icons.picture_as_pdf, color: Colors.redAccent),
+                  SizedBox(width: 8),
+                  Text('Sincronización PDF'),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Auto-guardar esta nota en PDF'),
+                    subtitle: const Text(
+                      'Exporta y actualiza automáticamente el PDF en tu Bóveda de Obsidian al guardar esta nota.',
+                    ),
+                    value: coreInfo.autoExportPdf,
+                    onChanged: (bool value) async {
+                      setDialogState(() {
+                        coreInfo.autoExportPdf = value;
+                      });
+                      setState(() {});
+                      await saveToFile();
+                      if (!mounted) return;
+                      if (value) {
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          const SnackBar(
+                            backgroundColor: Colors.green,
+                            content: Text(
+                              'Auto-exportación a PDF activada para esta nota',
+                            ),
+                          ),
+                        );
+                      } else {
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Auto-exportación a PDF desactivada para esta nota',
+                            ),
+                          ),
+                        );
+                      }
+                    },
+                  ),
+                  const Divider(),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.upload_file),
+                    title: const Text('Exportar a PDF ahora'),
+                    subtitle: const Text(
+                      'Guarda manualmente una copia en la Bóveda de inmediato',
+                    ),
+                    onTap: () async {
+                      Navigator.of(dialogContext).pop();
+                      if (stows.obsidianVaultPath.value == null) {
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          const SnackBar(
+                            backgroundColor: Colors.orange,
+                            content: Text(
+                              'Primero debes seleccionar la carpeta de tu Bóveda en Ajustes',
+                            ),
+                          ),
+                        );
+                        return;
+                      }
+                      await saveToFile();
+                      if (!mounted) return;
+                      final res = await PdfAutoExporter.autoExportToObsidian(
+                        coreInfo: coreInfo,
+                        context: this.context,
+                      );
+                      if (!mounted) return;
+                      if (res != null) {
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          SnackBar(
+                            backgroundColor: Colors.green,
+                            content: Text(
+                              'PDF guardado en Obsidian: ${p.basename(res)}',
+                            ),
+                          ),
+                        );
+                      } else {
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          const SnackBar(
+                            backgroundColor: Colors.red,
+                            content: Text('Error al guardar el PDF en la Bóveda'),
+                          ),
+                        );
+                      }
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cerrar'),
+                ),
+              ],
+            );
+          },
+        );
+      },
     );
   }
 
@@ -1705,43 +1826,16 @@ class EditorState extends State<Editor> with WidgetsBindingObserver {
                 ),
                 actions: [
                   IconButton(
-                    icon: const Icon(Icons.picture_as_pdf),
-                    tooltip: 'Guardar y exportar PDF a Obsidian',
-                    onPressed: () async {
-                      if (stows.obsidianVaultPath.value == null) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            backgroundColor: Colors.orange,
-                            content: Text(
-                              'Primero debes seleccionar la carpeta de tu Bóveda en Ajustes',
-                            ),
-                          ),
-                        );
-                        return;
-                      }
-                      await saveToFile();
-                      if (!context.mounted) return;
-                      final res = await PdfAutoExporter.autoExportToObsidian(
-                        coreInfo: coreInfo,
-                        context: context,
-                      );
-                      if (!context.mounted) return;
-                      if (res != null) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            backgroundColor: Colors.green,
-                            content: Text('PDF guardado en Obsidian: ${p.basename(res)}'),
-                          ),
-                        );
-                      } else {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            backgroundColor: Colors.red,
-                            content: Text('Error al guardar el PDF en la Bóveda'),
-                          ),
-                        );
-                      }
-                    },
+                    icon: Icon(
+                      coreInfo.autoExportPdf
+                          ? Icons.picture_as_pdf
+                          : Icons.picture_as_pdf_outlined,
+                      color: coreInfo.autoExportPdf ? Colors.green : null,
+                    ),
+                    tooltip: coreInfo.autoExportPdf
+                        ? 'Sincronización PDF activa (toca para opciones)'
+                        : 'Configurar sincronización PDF para esta nota',
+                    onPressed: _showPdfOptionsDialog,
                   ),
                   IconButton(
                     icon: const AdaptiveIcon(
