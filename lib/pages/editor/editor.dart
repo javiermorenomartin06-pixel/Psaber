@@ -97,7 +97,7 @@ class Editor extends StatefulWidget {
   State<Editor> createState() => EditorState();
 }
 
-class EditorState extends State<Editor> {
+class EditorState extends State<Editor> with WidgetsBindingObserver {
   final log = Logger('EditorState');
 
   late var coreInfo = EditorCoreInfo.placeholder;
@@ -183,12 +183,24 @@ class EditorState extends State<Editor> {
 
   @override
   void initState() {
+    WidgetsBinding.instance.addObserver(this);
     DynamicMaterialApp.addFullscreenListener(_setState);
 
     _initAsync();
     _assignKeybindings();
 
     super.initState();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      if (savingState.value == SavingState.waitingToSave) {
+        saveToFile();
+      }
+    }
   }
 
   void _initAsync() async {
@@ -990,12 +1002,21 @@ class EditorState extends State<Editor> {
 
     if (!mounted) return;
     if (stows.autoExportPdf.value && stows.obsidianVaultPath.value != null) {
-      unawaited(
-        PdfAutoExporter.autoExportToObsidian(
-          coreInfo: coreInfo,
-          context: context,
-        ),
-      );
+      PdfAutoExporter.autoExportToObsidian(
+        coreInfo: coreInfo,
+        context: context,
+      ).then((pdfPath) {
+        if (pdfPath != null && mounted) {
+          ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+            SnackBar(
+              duration: const Duration(seconds: 2),
+              content: Text('PDF sincronizado en Obsidian: ${p.basename(pdfPath)}'),
+            ),
+          );
+        }
+      }).catchError((e, st) {
+        log.warning('Auto-export PDF failed: $e', e, st);
+      });
     }
   }
 
@@ -1684,6 +1705,44 @@ class EditorState extends State<Editor> {
                 ),
                 actions: [
                   IconButton(
+                    icon: const Icon(Icons.picture_as_pdf),
+                    tooltip: 'Guardar y exportar PDF a Obsidian',
+                    onPressed: () async {
+                      if (stows.obsidianVaultPath.value == null) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            backgroundColor: Colors.orange,
+                            content: Text(
+                              'Primero debes seleccionar la carpeta de tu Bóveda en Ajustes',
+                            ),
+                          ),
+                        );
+                        return;
+                      }
+                      await saveToFile();
+                      if (!context.mounted) return;
+                      final res = await PdfAutoExporter.autoExportToObsidian(
+                        coreInfo: coreInfo,
+                        context: context,
+                      );
+                      if (!context.mounted) return;
+                      if (res != null) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('PDF guardado en Obsidian: ${p.basename(res)}'),
+                          ),
+                        );
+                      } else {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            backgroundColor: Colors.red,
+                            content: Text('Error al guardar el PDF en la Bóveda'),
+                          ),
+                        );
+                      }
+                    },
+                  ),
+                  IconButton(
                     icon: const AdaptiveIcon(
                       icon: Icons.insert_page_break,
                       cupertinoIcon: CupertinoIcons.add,
@@ -2078,6 +2137,7 @@ class EditorState extends State<Editor> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_cleanUpAsync());
 
     DynamicMaterialApp.removeFullscreenListener(_setState);

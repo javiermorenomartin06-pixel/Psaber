@@ -6,6 +6,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:saber/components/theming/adaptive_alert_dialog.dart';
 import 'package:saber/data/file_manager/file_manager.dart';
 import 'package:saber/data/nextcloud/saber_syncer.dart';
@@ -84,19 +85,44 @@ class SettingsObsidianDirectorySelector extends StatelessWidget {
   final String title;
   final IconData icon;
 
-  void onPressed(BuildContext context) async {
-    await showAdaptiveDialog(
-      context: context,
-      builder: (context) => DirectorySelector(
-        title: title,
-        initialDirectory: stows.obsidianVaultPath.value ?? FileManager.documentsDirectory,
-        mustBeEmpty: false,
-        mustBeDoneSyncing: false,
-        onConfirm: (dir) {
-          stows.obsidianVaultPath.value = dir;
-        },
-      ),
+  Future<void> onPressed(BuildContext context) async {
+    if (Platform.isAndroid) {
+      final status = await Permission.manageExternalStorage.request();
+      if (!status.isGranted && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: Colors.orange,
+            content: Text(
+              'Permite "Acceso a todos los archivos" para que la app pueda guardar en tu bóveda',
+            ),
+          ),
+        );
+      }
+    }
+
+    final directory = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Selecciona la carpeta de tu Bóveda de Obsidian',
+      initialDirectory: stows.obsidianVaultPath.value,
+      androidOptions: defaultTargetPlatform == .android
+          ? const FilePickerAndroidOptions(
+              safOptions: .new(
+                grant: .lifetime,
+                accessMode: .readWrite,
+                persistGrant: true,
+              ),
+            )
+          : const .new(),
     );
+
+    if (directory == null) return;
+    stows.obsidianVaultPath.value = directory;
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Bóveda de Obsidian configurada: $directory'),
+        ),
+      );
+    }
   }
 
   @override
@@ -116,8 +142,12 @@ class SettingsObsidianDirectorySelector extends StatelessWidget {
         subtitle: ValueListenableBuilder(
           valueListenable: stows.obsidianVaultPath,
           builder: (context, vaultPath, _) => Text(
-            vaultPath ?? 'No seleccionada (pulsa para elegir)',
-            style: const TextStyle(fontSize: 13),
+            vaultPath ?? 'No seleccionada (toca aquí para elegirla)',
+            style: TextStyle(
+              fontSize: 13,
+              color: vaultPath == null ? Theme.of(context).colorScheme.primary : null,
+              fontWeight: vaultPath == null ? FontWeight.bold : null,
+            ),
           ),
         ),
       ),
